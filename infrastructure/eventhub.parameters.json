@@ -1,0 +1,33 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "resourceGroupName": {
+            "value": "iot-rg"
+        },
+        "location": {
+            "value": "eastus"
+        },
+        "eventHubNamespaceName": {
+            "value": "car-eventhub-ns"
+        },
+        "eventHubName": {
+            "value": "car-eventhub"
+        },
+        "iotHubName": {
+            "value": "car-iot-hub-s1"
+        },
+        "partitionCount": {
+            "value": 2
+        },
+        "messageRetentionInDays": {
+            "value": 1
+        },
+        "skuName": {
+            "value": "Basic"
+        },
+        "skuCapacity": {
+            "value": 1
+        }
+    }
+} 
