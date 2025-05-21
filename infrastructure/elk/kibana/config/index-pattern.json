@@ -1,0 +1,24 @@
+{
+  "index_patterns": ["device-logs-*"],
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0
+    },
+    "mappings": {
+      "properties": {
+        "timestamp": { "type": "date" },
+        "DeviceId": { "type": "keyword" },
+        "LogLevel": { "type": "keyword" },
+        "Message": { "type": "text" },
+        "BatteryLevel": { "type": "float" },
+        "SignalStrength": { "type": "integer" },
+        "Temperature": { "type": "float" },
+        "Humidity": { "type": "float" },
+        "MotionDetected": { "type": "boolean" },
+        "DoorOpen": { "type": "boolean" },
+        "Status": { "type": "keyword" }
+      }
+    }
+  }
+} 

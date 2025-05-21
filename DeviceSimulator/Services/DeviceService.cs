@@ -1,50 +1,93 @@
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using DeviceSimulator.Models;
+using DeviceSimulator;
 using Microsoft.Azure.Devices.Client;
 using Microsoft.Azure.Devices.Shared;
 using System.Text;
 using System.Text.Json;
+using System.Diagnostics;
 
 namespace DeviceSimulator.Services;
 
-public class DeviceService
+public class DeviceService : BackgroundService
 {
-    private readonly DeviceClient _deviceClient;
-    private readonly SecurityDevice _device;
-    private readonly Action<string> _logAction;
+    private readonly ILogger<DeviceService> _logger;
+    private readonly LoggingService _loggingService;
+    private readonly MetricsService _metricsService;
     private readonly Random _random = new();
+    private readonly Device _device;
+    private readonly DeviceClient _deviceClient;
+    private readonly SecurityDevice _securityDevice;
+    private readonly Action<string> _logAction;
     private bool _isRunning;
     private int _telemetryInterval = 5000; // 5 seconds
 
-    public DeviceService(DeviceClient deviceClient, SecurityDevice device, Action<string> logAction)
+    public DeviceService(
+        ILogger<DeviceService> logger, 
+        LoggingService loggingService,
+        MetricsService metricsService,
+        DeviceClient deviceClient, 
+        SecurityDevice securityDevice)
     {
+        _logger = logger;
+        _loggingService = loggingService;
+        _metricsService = metricsService;
         _deviceClient = deviceClient;
-        _device = device;
-        _logAction = logAction;
+        _securityDevice = securityDevice;
+        _logAction = message => logger.LogInformation("{Message}", message);
+        _device = new Device
+        {
+            DeviceId = securityDevice.DeviceId,
+            Location = "Building A",
+            Status = "Online"
+        };
     }
 
-    public async Task StartAsync()
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _isRunning = true;
         _logAction("Device service started");
 
-        // Set up handlers
-        await _deviceClient.SetMethodHandlerAsync("SetTelemetryInterval", HandleSetTelemetryInterval, null);
-        await _deviceClient.SetMethodHandlerAsync("TriggerAlert", HandleTriggerAlert, null);
-        await _deviceClient.SetMethodHandlerAsync("PerformMaintenance", HandleMaintenance, null);
-        await _deviceClient.SetDesiredPropertyUpdateCallbackAsync(HandleDesiredPropertyUpdate, null);
-
-        while (_isRunning)
+        try
         {
-            try
+            // Set up handlers
+            await _deviceClient.SetMethodHandlerAsync("SetTelemetryInterval", HandleSetTelemetryInterval, null);
+            await _deviceClient.SetMethodHandlerAsync("TriggerAlert", HandleTriggerAlert, null);
+            await _deviceClient.SetMethodHandlerAsync("PerformMaintenance", HandleMaintenance, null);
+            await _deviceClient.SetDesiredPropertyUpdateCallbackAsync(HandleDesiredPropertyUpdate, null);
+
+            while (_isRunning && !stoppingToken.IsCancellationRequested)
             {
-                await SendTelemetryAsync();
-                await Task.Delay(TimeSpan.FromSeconds(_device.ReportingInterval));
+                using var activity = Telemetry.Source.StartActivity("GenerateTelemetry");
+                activity?.SetTag("device.id", _device.DeviceId);
+                activity?.SetTag("device.location", _device.Location);
+
+                try
+                {
+                    await SendTelemetryAsync();
+                    await Task.Delay(TimeSpan.FromSeconds(_device.ReportingInterval), stoppingToken);
+                }
+                catch (Exception ex)
+                {
+                    activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+                    _logger.LogError(ex, "Error occurred while sending telemetry for device {DeviceId}", _device.DeviceId);
+                    await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+                }
             }
-            catch (Exception ex)
-            {
-                _logAction($"Error sending telemetry: {ex.Message}");
-                await Task.Delay(5000); // Wait before retrying
-            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Fatal error in device service");
+            throw;
+        }
+        finally
+        {
+            _isRunning = false;
+            _logAction("Device service stopped");
         }
     }
 
@@ -54,67 +97,93 @@ public class DeviceService
         UpdateDeviceState();
 
         // Create telemetry message
-        var telemetry = new
+        var telemetry = new TelemetryData
         {
-            timestamp = DateTime.UtcNow,
-            deviceId = _device.DeviceId,
-            status = _device.Status.ToString(),
-            batteryLevel = _device.BatteryLevel,
-            signalStrength = _device.SignalStrength,
-            temperature = _device.Temperature,
-            humidity = _device.Humidity,
-            motionDetected = _device.MotionDetected,
-            doorOpen = _device.DoorOpen,
-            cellularData = _device.CellularData,
-            firmwareVersion = _device.FirmwareVersion
+            Timestamp = DateTime.UtcNow,
+            Temperature = Math.Round(_securityDevice.Temperature, 2),
+            Humidity = Math.Round(_securityDevice.Humidity, 2),
+            Pressure = Math.Round(1000 + _random.NextDouble() * 50, 2)
         };
 
+        // Record metrics
+        _metricsService.RecordTelemetry(
+            _device.DeviceId,
+            _device.Location,
+            telemetry.Temperature,
+            telemetry.Humidity,
+            telemetry.Pressure
+        );
+
+        // Record device state
+        _metricsService.RecordDeviceState(
+            _device.DeviceId,
+            _securityDevice.Status.ToString(),
+            _securityDevice.BatteryLevel,
+            _securityDevice.SignalStrength
+        );
+
+        _loggingService.LogTelemetrySent(_device.DeviceId, telemetry);
+        _logger.LogInformation("Telemetry sent for device {DeviceId}: {Telemetry}", _device.DeviceId, telemetry);
+
+        // Send to IoT Hub and measure duration
         var messageString = JsonSerializer.Serialize(telemetry);
         var messageBytes = Encoding.UTF8.GetBytes(messageString);
-
-        // Send to IoT Hub (will be routed to Event Hub)
         var message = new Message(messageBytes)
         {
             ContentType = "application/json",
             ContentEncoding = "utf-8"
         };
-        await _deviceClient.SendEventAsync(message);
-        _logAction("Telemetry sent to IoT Hub (will be routed to Event Hub)");
+
+        var startTime = DateTime.UtcNow;
+        try
+        {
+            await _deviceClient.SendEventAsync(message);
+            var duration = (DateTime.UtcNow - startTime).TotalMilliseconds;
+            _metricsService.RecordTelemetryDuration(_device.DeviceId, _device.Location, duration);
+            _logAction($"Telemetry sent to IoT Hub in {duration:F2}ms");
+        }
+        catch (Exception ex)
+        {
+            var duration = (DateTime.UtcNow - startTime).TotalMilliseconds;
+            _metricsService.RecordTelemetryDuration(_device.DeviceId, _device.Location, duration);
+            _logger.LogError(ex, "Failed to send telemetry after {Duration}ms", duration);
+            throw;
+        }
     }
 
     private void UpdateDeviceState()
     {
         // Simulate battery drain
-        _device.BatteryLevel = Math.Max(0, _device.BatteryLevel - 0.1);
+        _securityDevice.BatteryLevel = Math.Max(0, _securityDevice.BatteryLevel - 0.1);
 
         // Simulate signal strength changes
-        _device.SignalStrength = _random.Next(1, 6);
+        _securityDevice.SignalStrength = _random.Next(1, 6);
 
         // Simulate temperature and humidity changes
-        _device.Temperature = 20 + _random.NextDouble() * 10;
-        _device.Humidity = 40 + _random.NextDouble() * 30;
+        _securityDevice.Temperature = 20 + _random.NextDouble() * 10;
+        _securityDevice.Humidity = 40 + _random.NextDouble() * 30;
 
         // Simulate motion detection
         if (_random.NextDouble() < 0.1)
         {
-            _device.MotionDetected = true;
+            _securityDevice.MotionDetected = true;
             _logAction("Motion detected!");
         }
         else
         {
-            _device.MotionDetected = false;
+            _securityDevice.MotionDetected = false;
         }
 
         // Simulate door state
         if (_random.NextDouble() < 0.05)
         {
-            _device.DoorOpen = !_device.DoorOpen;
-            _logAction($"Door {( _device.DoorOpen ? "opened" : "closed" )}");
+            _securityDevice.DoorOpen = !_securityDevice.DoorOpen;
+            _logAction($"Door {( _securityDevice.DoorOpen ? "opened" : "closed" )}");
         }
 
         // Update cellular data
-        _device.CellularData.DataUsageMB += _random.NextDouble() * 0.1;
-        _device.CellularData.LastSync = DateTime.UtcNow;
+        _securityDevice.CellularData.DataUsageMB += _random.NextDouble() * 0.1;
+        _securityDevice.CellularData.LastSync = DateTime.UtcNow;
 
         // Check alert conditions
         CheckAlertConditions();
@@ -125,40 +194,50 @@ public class DeviceService
         var alerts = new List<string>();
 
         // Check temperature thresholds
-        if (_device.Temperature > _device.AlertThresholds["temperatureHigh"])
+        if (_securityDevice.Temperature > _securityDevice.AlertThresholds["temperatureHigh"])
         {
-            alerts.Add($"High temperature alert: {_device.Temperature:F1}°C");
+            var alert = $"High temperature alert: {_securityDevice.Temperature:F1}°C";
+            alerts.Add(alert);
+            _metricsService.RecordAlert(_device.DeviceId, "temperature", alert);
         }
-        else if (_device.Temperature < _device.AlertThresholds["temperatureLow"])
+        else if (_securityDevice.Temperature < _securityDevice.AlertThresholds["temperatureLow"])
         {
-            alerts.Add($"Low temperature alert: {_device.Temperature:F1}°C");
+            var alert = $"Low temperature alert: {_securityDevice.Temperature:F1}°C";
+            alerts.Add(alert);
+            _metricsService.RecordAlert(_device.DeviceId, "temperature", alert);
         }
 
         // Check humidity thresholds
-        if (_device.Humidity > _device.AlertThresholds["humidityHigh"])
+        if (_securityDevice.Humidity > _securityDevice.AlertThresholds["humidityHigh"])
         {
-            alerts.Add($"High humidity alert: {_device.Humidity:F1}%");
+            var alert = $"High humidity alert: {_securityDevice.Humidity:F1}%";
+            alerts.Add(alert);
+            _metricsService.RecordAlert(_device.DeviceId, "humidity", alert);
         }
-        else if (_device.Humidity < _device.AlertThresholds["humidityLow"])
+        else if (_securityDevice.Humidity < _securityDevice.AlertThresholds["humidityLow"])
         {
-            alerts.Add($"Low humidity alert: {_device.Humidity:F1}%");
+            var alert = $"Low humidity alert: {_securityDevice.Humidity:F1}%";
+            alerts.Add(alert);
+            _metricsService.RecordAlert(_device.DeviceId, "humidity", alert);
         }
 
         // Check battery level
-        if (_device.BatteryLevel < _device.AlertThresholds["batteryLow"])
+        if (_securityDevice.BatteryLevel < _securityDevice.AlertThresholds["batteryLow"])
         {
-            alerts.Add($"Low battery alert: {_device.BatteryLevel:F1}%");
+            var alert = $"Low battery alert: {_securityDevice.BatteryLevel:F1}%";
+            alerts.Add(alert);
+            _metricsService.RecordAlert(_device.DeviceId, "battery", alert);
         }
 
         // Send alerts if any
         if (alerts.Any())
         {
-            _device.Status = DeviceStatus.Alert;
+            _securityDevice.Status = DeviceStatus.Alert;
             SendAlertsAsync(alerts).Wait();
         }
         else
         {
-            _device.Status = DeviceStatus.Online;
+            _securityDevice.Status = DeviceStatus.Online;
         }
     }
 
@@ -167,7 +246,7 @@ public class DeviceService
         var alertData = new
         {
             timestamp = DateTime.UtcNow,
-            deviceId = _device.DeviceId,
+            deviceId = _securityDevice.DeviceId,
             type = "alert",
             alerts = alerts
         };
@@ -190,7 +269,7 @@ public class DeviceService
         
         if (payload != null && payload.TryGetValue("interval", out int interval))
         {
-            _telemetryInterval = interval * 1000; // Convert to milliseconds
+            _device.ReportingInterval = interval;
             Console.WriteLine($"Setting telemetry interval to {interval} seconds");
             return new MethodResponse(200);
         }
@@ -205,7 +284,7 @@ public class DeviceService
         
         if (payload != null && payload.TryGetValue("message", out string? message))
         {
-            _device.Status = DeviceStatus.Alert;
+            _securityDevice.Status = DeviceStatus.Alert;
             await SendAlertsAsync(new List<string> { message });
             return new MethodResponse(200);
         }
@@ -216,15 +295,15 @@ public class DeviceService
     private async Task<MethodResponse> HandleMaintenance(MethodRequest methodRequest, object? userContext)
     {
         Console.WriteLine($"Received method call: {methodRequest.Name}");
-        _device.Status = DeviceStatus.Maintenance;
-        _device.LastMaintenance = DateTime.UtcNow;
-        _device.BatteryLevel = 100.0; // Simulate battery replacement
+        _securityDevice.Status = DeviceStatus.Maintenance;
+        _securityDevice.LastMaintenance = DateTime.UtcNow;
+        _securityDevice.BatteryLevel = 100.0; // Simulate battery replacement
 
         var reportedProperties = new TwinCollection
         {
-            ["status"] = _device.Status.ToString(),
-            ["lastMaintenance"] = _device.LastMaintenance,
-            ["batteryLevel"] = _device.BatteryLevel
+            ["status"] = _securityDevice.Status.ToString(),
+            ["lastMaintenance"] = _securityDevice.LastMaintenance,
+            ["batteryLevel"] = _securityDevice.BatteryLevel
         };
 
         await _deviceClient.UpdateReportedPropertiesAsync(reportedProperties);
@@ -253,7 +332,7 @@ public class DeviceService
                 case "motionSensitivity":
                     if (value is int sensitivity)
                     {
-                        _device.MotionSensitivity = sensitivity;
+                        _securityDevice.MotionSensitivity = sensitivity;
                         _logAction($"Motion sensitivity updated to {sensitivity}");
                     }
                     break;
@@ -269,7 +348,7 @@ public class DeviceService
                                 newThresholds[threshold.Name] = threshold.Value.GetDouble();
                             }
                         }
-                        _device.AlertThresholds = newThresholds;
+                        _securityDevice.AlertThresholds = newThresholds;
                         _logAction("Alert thresholds updated");
                     }
                     break;
@@ -280,16 +359,10 @@ public class DeviceService
         var reportedProperties = new TwinCollection
         {
             ["reportingInterval"] = _device.ReportingInterval,
-            ["motionSensitivity"] = _device.MotionSensitivity,
-            ["alertThresholds"] = _device.AlertThresholds
+            ["motionSensitivity"] = _securityDevice.MotionSensitivity,
+            ["alertThresholds"] = _securityDevice.AlertThresholds
         };
 
         await _deviceClient.UpdateReportedPropertiesAsync(reportedProperties);
-    }
-
-    public void Stop()
-    {
-        _isRunning = false;
-        _logAction("Device service stopped");
     }
 } 

@@ -1,0 +1,24 @@
+server.host: "0.0.0.0"
+server.name: "kibana"
+elasticsearch.hosts: ["http://elasticsearch:9200"]
+elasticsearch.requestTimeout: 30000
+elasticsearch.pingTimeout: 15000
+
+# Security settings
+xpack.security.enabled: false
+xpack.reporting.enabled: false
+xpack.encryptedSavedObjects.encryptionKey: "something_at_least_32_characters_long"
+
+# Monitoring
+monitoring.ui.container.elasticsearch.enabled: true
+monitoring.ui.container.logstash.enabled: true
+
+# Default index pattern
+kibana.defaultAppId: "discover"
+kibana.index: ".kibana"
+
+# Configure logging
+logging.root.level: info
+logging.root.appenders: [default]
+logging.appenders.default.type: console
+logging.appenders.default.layout.type: pattern 

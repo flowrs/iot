@@ -1,0 +1,16 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+      http:
+
+exporters:
+  elasticsearch:
+    endpoints: ["http://elasticsearch:9200"]
+    # Optional: configure authentication if needed
+
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [elasticsearch] 
